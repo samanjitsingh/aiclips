@@ -40,7 +40,16 @@ def snap(transcript: dict, start: float, end: float, pad_in=0.12, pad_out=0.35) 
     return round(s, 3), round(e, 3)
 
 
-def verify(path: Path, expected: float) -> tuple[bool, str]:
+def av_sync(info: dict) -> tuple[float, float]:
+    """(start offset ms, end offset ms) between the video and audio streams."""
+    v = next(s for s in info["streams"] if s["codec_type"] == "video")
+    a = next(s for s in info["streams"] if s["codec_type"] == "audio")
+    vs, as_ = float(v.get("start_time", 0)), float(a.get("start_time", 0))
+    ve, ae = vs + float(v.get("duration", 0)), as_ + float(a.get("duration", 0))
+    return round((as_ - vs) * 1000, 1), round((ae - ve) * 1000, 1)
+
+
+def verify(path: Path, expected: float, fps: float | None = None) -> tuple[bool, str]:
     if not path.exists() or path.stat().st_size == 0:
         return False, "missing or empty"
     try:
@@ -57,7 +66,21 @@ def verify(path: Path, expected: float) -> tuple[bool, str]:
         problems.append(f"duration {dur:.2f}s vs expected {expected:.2f}s")
     if a is None:
         problems.append("no audio")
-    return not problems, "; ".join(problems) or f"ok ({dur:.2f}s, {path.stat().st_size / 1e6:.1f} MB)"
+    sync = ""
+    if v and a:
+        d0, d1 = av_sync(info)
+        sync = f", A/V start offset {d0:+.1f} ms, end offset {d1:+.1f} ms"
+        if d0 != 0:
+            problems.append(f"A/V start offset {d0} ms")
+        if abs(d1) > 1000 / 30 + 25:  # within one frame + one AAC packet
+            problems.append(f"A/V end mismatch {d1} ms")
+    if fps:
+        num, den = v["avg_frame_rate"].split("/")
+        real = float(num) / float(den)
+        if abs(real - fps) > 0.5:
+            problems.append(f"fps {real:.2f} != {fps}")
+    ok_msg = f"ok ({dur:.2f}s, {path.stat().st_size / 1e6:.1f} MB, {v and v['avg_frame_rate']} fps{sync})"
+    return not problems, "; ".join(problems) or ok_msg
 
 
 def main() -> None:
@@ -70,35 +93,47 @@ def main() -> None:
     ap.add_argument("--layout", default="auto", choices=["auto", "crop", "pillarbox"])
     ap.add_argument("--cleanup", action="store_true", help="Wipe temp_work after all clips verify")
     ap.add_argument("--no-snap", action="store_true")
+    ap.add_argument("--naming", choices=["slug", "index"], default="slug",
+                    help="slug: clip_01_<title>.mp4, index: clip_1.mp4")
     args = ap.parse_args()
 
     plan = load_json(args.plan)["clips"]
-    transcript = load_json(args.transcript)
+    transcripts: dict[str, dict] = {}
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     TEMP_DIR.mkdir(exist_ok=True)
 
     results, all_ok = [], True
     for n, clip in enumerate(plan, 1):
+        # Per-clip overrides let one plan span several downloaded sections of a long stream.
+        source = clip.get("source", args.source)
+        tr_path = clip.get("transcript", args.transcript)
+        offset = float(clip.get("offset", 0.0))  # section start in the original video timeline
+        transcript = transcripts.setdefault(tr_path, load_json(tr_path))
         start, end = float(clip["start"]), float(clip["end"])
         if not args.no_snap:
             start, end = snap(transcript, start, end)
-        name = f"clip_{n:02d}_{slugify(clip.get('title') or clip.get('hook') or 'clip')}"
+        name = f"clip_{n}" if args.naming == "index" else \
+            f"clip_{n:02d}_{slugify(clip.get('title') or clip.get('hook') or 'clip')}"
         cropped = TEMP_DIR / f"{name}_cropped.mp4"
         final = out_dir / f"{name}.mp4"
         log(f"=== {name}: {start:.2f}-{end:.2f} ({end - start:.1f}s)")
         try:
-            subprocess.run([PY, str(HERE / "smart_crop.py"), args.source, "--start", str(start), "--end", str(end),
+            subprocess.run([PY, str(HERE / "smart_crop.py"), source, "--start", str(start), "--end", str(end),
                             "--out", str(cropped), "--fps", args.fps, "--layout", args.layout], check=True)
-            subprocess.run([PY, str(HERE / "render_captions.py"), "--transcript", args.transcript,
+            subprocess.run([PY, str(HERE / "render_captions.py"), "--transcript", tr_path,
                             "--start", str(start), "--end", str(end), "--video", str(cropped),
                             "--out", str(final)], check=True)
-            ok, msg = verify(final, end - start)
+            ok, msg = verify(final, end - start, None if args.fps == "auto" else float(args.fps))
         except subprocess.CalledProcessError as e:
             ok, msg = False, f"step failed: {e}"
         all_ok &= ok
         log(f"{'PASS' if ok else 'FAIL'} {final.name}: {msg}")
+        track = cropped.with_suffix(".track.json")
+        layout = load_json(track).get("layout") if track.exists() else None
         results.append({"file": str(final), "start": start, "end": end, "duration": round(end - start, 2),
+                        "source_start": round(offset + start, 3), "source_end": round(offset + end, 3),
+                        "layout": layout,
                         "title": clip.get("title"), "hook": clip.get("hook"), "verified": ok, "check": msg})
 
     save_json({"clips": results}, out_dir / "manifest.json")
@@ -111,7 +146,8 @@ def main() -> None:
         else:
             log("Not cleaning temp_work: some clips failed verification")
     for r in results:
-        print(f"{'OK  ' if r['verified'] else 'FAIL'} {r['file']}  [{r['start']:.1f}-{r['end']:.1f}s]  {r['check']}")
+        print(f"{'OK  ' if r['verified'] else 'FAIL'} {r['file']}  [{r['source_start']:.2f}-{r['source_end']:.2f}s]"
+              f"  {r['layout']}  {r['check']}")
     sys.exit(0 if all_ok else 1)
 
 
