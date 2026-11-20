@@ -1,0 +1,9 @@
+# Pinned for a protobuf-compatible set (mediapipe 0.10.21 requires protobuf<5).
+# Use Python 3.10-3.12: mediapipe 0.10.21 has no Python 3.13 wheels.
+faster-whisper==1.2.1
+mediapipe==0.10.21
+protobuf==4.25.9
+opencv-python-headless==4.11.0.86
+numpy==1.26.4
+pysubs2==1.9.1
+yt-dlp[default]>=2026.10.26

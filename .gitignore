@@ -1,0 +1,7 @@
+.venv/
+temp_work/*
+!temp_work/.gitkeep
+final_clips/*
+!final_clips/.gitkeep
+__pycache__/
+*.pyc
