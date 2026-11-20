@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -33,9 +34,16 @@ def is_url(s: str) -> bool:
     return s.startswith(("http://", "https://", "www.", "youtu"))
 
 
+def hms(t: str) -> float:
+    sec = 0.0
+    for part in t.strip().split(":"):
+        sec = sec * 60 + float(part)
+    return sec
+
+
 def download(url: str, out_dir: Path, max_height: int, cookies: str | None, attempts: int,
-             live_from_start: bool = False) -> Path:
-    target = out_dir / "source.mp4"
+             live_from_start: bool = False, section: str | None = None, name: str = "source") -> Path:
+    target = out_dir / f"{name}.mp4"
     fmt = (
         f"bv*[height<={max_height}][vcodec^=avc1]+ba[ext=m4a]/"
         f"bv*[height<={max_height}]+ba/"
@@ -50,8 +58,11 @@ def download(url: str, out_dir: Path, max_height: int, cookies: str | None, atte
         "--retry-sleep", "http:exp=1:20", "--retry-sleep", "fragment:exp=1:20",
         "--concurrent-fragments", "4",
         "--socket-timeout", "30",
-        "-o", str(out_dir / "source.%(ext)s"),
+        "-o", str(out_dir / f"{name}.%(ext)s"),
     ]
+    if section:
+        # Only fetch this window of a long VOD/stream (ffmpeg seeks inside the remote file).
+        base += ["--download-sections", f"*{section}", "--force-keyframes-at-cuts"]
     if shutil.which("node"):
         base += ["--js-runtimes", "node"]
     if cookies:
@@ -66,7 +77,10 @@ def download(url: str, out_dir: Path, max_height: int, cookies: str | None, atte
         client = CLIENT_SETS[i % len(CLIENT_SETS)]
         cmd = base + ["--extractor-args", client, url]
         log(f"yt-dlp attempt {i + 1}/{attempts} with {client}")
-        proc = subprocess.run(cmd)
+        env = dict(os.environ)
+        if env.get("HTTPS_PROXY") and not env.get("http_proxy"):
+            env["http_proxy"] = env["HTTPS_PROXY"]  # ffmpeg (used for sections) only reads http_proxy
+        proc = subprocess.run(cmd, env=env)
         if proc.returncode == 0 and target.exists() and target.stat().st_size > 0:
             return target
         last_err = proc.returncode
@@ -106,12 +120,29 @@ def main() -> None:
     ap.add_argument("--cookies", help="Browser name (e.g. chrome) or cookies.txt path for gated videos")
     ap.add_argument("--attempts", type=int, default=6)
     ap.add_argument("--live-from-start", action="store_true", help="For ongoing livestreams")
+    ap.add_argument("--sections", nargs="+", metavar="START-END",
+                    help="Download only these windows of a long VOD, e.g. 1:32:00-1:33:30 2:42:30-2:46:00. "
+                         "Each becomes temp_work/section_N.mp4; offsets are saved in sections.json")
     args = ap.parse_args()
 
     require_bin("ffmpeg")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.sections:
+        if not is_url(args.source):
+            sys.exit("--sections needs a URL (for local files the pipeline already seeks)")
+        sections = []
+        for i, sec in enumerate(args.sections, 1):
+            start = hms(sec.split("-")[0])
+            p = download(args.source, out_dir, args.max_height, args.cookies, args.attempts,
+                         section=sec, name=f"section_{i}")
+            meta = {"section": sec, "offset": start, "path": str(p.resolve())}
+            meta.update(media_info(p))
+            sections.append(meta)
+        save_json({"source": args.source, "sections": sections}, out_dir / "sections.json")
+        print(json.dumps(sections, indent=2))
+        return
     if is_url(args.source):
         path = download(args.source, out_dir, args.max_height, args.cookies, args.attempts,
                         args.live_from_start)

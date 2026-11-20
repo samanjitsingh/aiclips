@@ -24,10 +24,10 @@ Or ask your agent: *"Use the universal-clipper skill on <URL>"*. See
 
 | Script | Purpose |
 |---|---|
-| `scripts/ingest.py` | yt-dlp (≤1080p, client rotation + retries) or local file → `temp_work/source.mp4` |
+| `scripts/ingest.py` | yt-dlp (≤1080p, client rotation + retries, `--sections` for long streams) or local file |
 | `scripts/transcribe.py` | faster-whisper word timestamps (GPU auto / CPU int8), en / hi / `--hinglish` |
 | `scripts/score_hooks.py` | Sentence-aligned 30–58 s candidates ranked by hook/emotion heuristics |
-| `scripts/smart_crop.py` | MediaPipe tracking, smoothed 9:16 pan, blurred pillarbox fallback |
+| `scripts/smart_crop.py` | Auto framing: streamer split-screen, smoothed speaker-tracking 9:16 crop, blurred pillarbox |
 | `scripts/render_captions.py` | Karaoke `.ass` captions + final H.264 CRF 20 / AAC 192k burn |
 | `scripts/make_clips.py` | Renders a clip plan, verifies outputs, optional `--cleanup` |
 | `scripts/run_pipeline.py` | All of the above in one command |

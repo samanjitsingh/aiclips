@@ -26,6 +26,8 @@ from common import OUT_H, OUT_W, log, media_info, save_json  # noqa: E402
 
 ANALYSIS_FPS = 10.0
 ANALYSIS_W = 640
+SCAN_W = 1280         # decode width; quadrants of this are scanned for small facecam faces
+SCAN_EVERY = 5        # quadrant scan rate = ANALYSIS_FPS / SCAN_EVERY (2 Hz)
 
 
 # --------------------------------------------------------------------------- decode
@@ -54,17 +56,39 @@ class SubjectDetector:
                                            min_detection_confidence=0.5, min_tracking_confidence=0.5)
         self.min_face_h = min_face_h
 
-    def faces(self, rgb) -> list[tuple[float, float, float, float]]:
-        """Return [(cx, w, h, score)] in normalised coords for faces big enough to track."""
-        res = self.face.process(rgb)
+    def corner_faces(self, rgb):
+        """Run the detector on each quadrant: catches facecam faces too small for a full-frame pass."""
+        h, w = rgb.shape[:2]
         out = []
+        for qx in (0, 1):
+            for qy in (0, 1):
+                tile = np.ascontiguousarray(rgb[qy * h // 2:(qy + 1) * h // 2, qx * w // 2:(qx + 1) * w // 2])
+                for d in self.face.process(tile).detections or []:
+                    bb = d.location_data.relative_bounding_box
+                    x, y = (qx + bb.xmin) / 2, (qy + bb.ymin) / 2
+                    fw, fh = bb.width / 2, bb.height / 2
+                    cx, cy = x + fw / 2, y + fh / 2
+                    if 0.025 <= fh < 0.18 and (cx < 0.3 or cx > 0.7) and (cy < 0.35 or cy > 0.62):
+                        out.append((x, y, fw, fh, float(d.score[0])))
+        return out
+
+    def faces(self, rgb):
+        """Return (big, corner) faces in normalised coords.
+
+        big:    [(cx, w, h, score)] faces large enough to reframe on.
+        corner: [(x, y, w, h, score)] small faces in a frame corner: facecam-overlay candidates.
+        """
+        res = self.face.process(rgb)
+        big, small = [], []
         for d in res.detections or []:
             bb = d.location_data.relative_bounding_box
-            if bb.height < self.min_face_h:
-                continue  # tiny face (e.g. gaming facecam) -> not worth reframing on
             cx = min(max(bb.xmin + bb.width / 2, 0.0), 1.0)
-            out.append((cx, bb.width, bb.height, float(d.score[0])))
-        return out
+            cy = bb.ymin + bb.height / 2
+            if 0.025 <= bb.height < 0.18 and (cx < 0.3 or cx > 0.7) and (cy < 0.35 or cy > 0.62):
+                small.append((bb.xmin, bb.ymin, bb.width, bb.height, float(d.score[0])))  # corner face
+            if bb.height >= self.min_face_h:
+                big.append((cx, bb.width, bb.height, float(d.score[0])))
+        return big, small
 
     def pose_center(self, rgb) -> float | None:
         res = self.pose.process(rgb)
@@ -96,46 +120,66 @@ def choose_target(faces, prev: float | None, crop_frac: float) -> float:
 def analyse(src: str, start: float, dur: float, info: dict, args) -> dict:
     aw = ANALYSIS_W
     ah = int(round(info["height"] * aw / info["width"] / 2) * 2)
+    sw = min(SCAN_W, info["width"] // 2 * 2)
+    sh = int(round(info["height"] * sw / info["width"] / 2) * 2)
     crop_frac = min(1.0, (info["height"] * 9 / 16) / info["width"])
     det = SubjectDetector(args.min_face_height)
 
     xs, cuts, prev, prev_hist = [], [], None, None
-    vf = f"fps={ANALYSIS_FPS},scale={aw}:{ah}"
-    for i, rgb in enumerate(ffmpeg_reader(src, start, dur, vf, aw, ah, "rgb24")):
+    bigs, smalls, scans = [], [], 0
+    vf = f"fps={ANALYSIS_FPS},scale={sw}:{sh}"
+    for i, big_rgb in enumerate(ffmpeg_reader(src, start, dur, vf, sw, sh, "rgb24")):
+        rgb = cv2.resize(big_rgb, (aw, ah), interpolation=cv2.INTER_AREA)
         small = cv2.resize(rgb, (160, int(160 * ah / aw)))
         hist = cv2.calcHist([cv2.cvtColor(small, cv2.COLOR_RGB2HSV)], [0, 1], None, [32, 32], [0, 180, 0, 256])
         cv2.normalize(hist, hist)
         cuts.append(prev_hist is not None and cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL) < args.cut_threshold)
         prev_hist = hist
 
-        faces = det.faces(rgb)
+        faces, small = det.faces(rgb)
+        bigs.append(faces)
+        if i % SCAN_EVERY == 0:
+            scans += 1
+            small = small + det.corner_faces(big_rgb)
+            if small:
+                smalls.append(max(small, key=lambda f: f[2] * f[3] * f[4]))
         x = choose_target(faces, None if cuts[-1] else prev, crop_frac) if faces else det.pose_center(rgb)
         xs.append(np.nan if x is None else x)
         if x is not None:
             prev = x
     n = len(xs)
-    log(f"Analysed {n} samples: subject found in {np.sum(~np.isnan(xs))}, {sum(cuts)} shot cuts")
-    return {"x": np.array(xs, float), "cut": np.array(cuts, bool), "crop_frac": crop_frac}
+    log(f"Analysed {n} samples: subject found in {np.sum(~np.isnan(xs))}, {sum(cuts)} shot cuts, "
+        f"small/facecam faces in {len(smalls)}")
+    return {"x": np.array(xs, float), "cut": np.array(cuts, bool), "crop_frac": crop_frac,
+            "facecam": detect_facecam(smalls, scans, bigs, n)}
+
+
+def detect_facecam(smalls: list, scans: int, bigs: list, n: int):
+    """A corner face that stays put for most of the clip = streamer facecam overlay."""
+    if n == 0 or scans == 0 or len(smalls) < 0.35 * scans:
+        return None
+    a = np.array([s[:4] for s in smalls])
+    cx, cy = a[:, 0] + a[:, 2] / 2, a[:, 1] + a[:, 3] / 2
+    mx, my = float(np.median(cx)), float(np.median(cy))
+    if np.median(np.abs(cx - mx)) > 0.03 or np.median(np.abs(cy - my)) > 0.03:
+        return None  # moving face = in-game character / crowd, not an overlay
+    # Any other large face on screen for long (e.g. a podcast guest) -> not a gaming layout.
+    others = sum(any(abs(f[0] - mx) > 0.1 for f in fs) for fs in bigs)
+    if others > 0.3 * n:
+        return None
+    return [mx, my, float(np.median(a[:, 2])), float(np.median(a[:, 3]))]
 
 
 def smooth_track(x: np.ndarray, cuts: np.ndarray, args) -> tuple[np.ndarray, np.ndarray]:
     """Return (camera_centre, crop_mode) per analysis sample."""
     n = len(x)
     has = ~np.isnan(x)
-    mode = np.ones(n, bool)
-    # Long subject-less runs -> blurred layout. Short gaps are bridged by holding.
-    max_gap = int(round(args.no_subject_sec * ANALYSIS_FPS))
-    i = 0
-    while i < n:
-        if not has[i]:
-            j = i
-            while j < n and not has[j]:
-                j += 1
-            if j - i > max_gap:
-                mode[i:j] = False
-            i = j
-        else:
-            i += 1
+    # Subject presence over a centred window of --no-subject-sec: a gap longer than that drives
+    # the average to ~0 (-> blurred layout); shorter gaps, and a few stray false detections
+    # inside a long gap, don't flip the layout.
+    win = int(round(args.no_subject_sec * ANALYSIS_FPS)) + 1
+    presence = np.convolve(has.astype(float), np.ones(win) / win, mode="same")
+    mode = presence >= 0.25
     if not has.any():
         return np.full(n, 0.5), np.zeros(n, bool)
 
@@ -187,6 +231,33 @@ class Layouts:
         self.fg_x, self.fg_y = (OUT_W - self.fg_w) // 2, (OUT_H - self.fg_h) // 2
         self.bg_s = max(OUT_W / w, OUT_H / h)
 
+    def setup_split(self, facecam, top_frac: float, cam_zoom: float):
+        """Top panel = facecam region, bottom panel = centre gameplay crop."""
+        self.top_h = int(round(OUT_H * top_frac / 2) * 2)
+        self.bot_h = OUT_H - self.top_h
+        fcx, fcy, fw, fh = facecam
+        ar_top = OUT_W / self.top_h
+        h = min(fh * self.h * cam_zoom, self.h)
+        w = min(h * ar_top, self.w)
+        h = w / ar_top
+        x0 = float(np.clip(fcx * self.w - w / 2, 0, self.w - w))
+        y0 = float(np.clip((fcy + 0.1 * fh) * self.h - h / 2, 0, self.h - h))
+        self.cam_rect = (int(x0), int(y0), int(w), int(h))
+        ar_bot = OUT_W / self.bot_h
+        gh = self.h
+        gw = min(gh * ar_bot, self.w)
+        gh = gw / ar_bot
+        self.game_rect = (int((self.w - gw) / 2), int((self.h - gh) / 2), int(gw), int(gh))
+
+    def split(self, frame):
+        x, y, w, h = self.cam_rect
+        top = cv2.resize(frame[y:y + h, x:x + w], (OUT_W, self.top_h), interpolation=cv2.INTER_LINEAR)
+        x, y, w, h = self.game_rect
+        bot = cv2.resize(frame[y:y + h, x:x + w], (OUT_W, self.bot_h), interpolation=cv2.INTER_LINEAR)
+        out = np.vstack([top, bot])
+        out[self.top_h - 3:self.top_h + 3] = 0  # thin seam
+        return out
+
     def crop(self, frame, cx_norm: float):
         if self.vertical_src:
             return self.pillar(frame)
@@ -208,9 +279,12 @@ class Layouts:
         return bg
 
 
-def render(src: str, start: float, dur: float, info: dict, cam, mode, cuts, out: str, fps: float, args):
+def render(src: str, start: float, dur: float, info: dict, cam, mode, cuts, out: str, fps: float, args,
+           facecam=None):
     w, h = info["width"], info["height"]
     lay = Layouts(w, h)
+    if facecam is not None:
+        lay.setup_split(facecam, args.split_top, args.cam_zoom)
     n_s = len(cam)
     t_s = np.arange(n_s) / ANALYSIS_FPS
     ramp = 1.0 / max(args.transition_sec * fps, 1)
@@ -235,7 +309,9 @@ def render(src: str, start: float, dur: float, info: dict, cam, mode, cuts, out:
                 weight = target  # hard cut in the source -> switch layout on the cut, no fade
             else:
                 weight += np.clip(target - weight, -ramp, ramp)
-            if weight >= 0.999:
+            if facecam is not None:
+                img = lay.split(frame)
+            elif weight >= 0.999:
                 img = lay.crop(frame, cx)
             elif weight <= 0.001:
                 img = lay.pillar(frame)
@@ -267,7 +343,12 @@ def main() -> None:
     ap.add_argument("--cut-threshold", type=float, default=0.55)
     ap.add_argument("--crf", type=int, default=14, help="Intermediate quality (final encode is CRF 20)")
     ap.add_argument("--preset", default="veryfast")
-    ap.add_argument("--layout", choices=["auto", "crop", "pillarbox"], default="auto")
+    ap.add_argument("--layout", choices=["auto", "crop", "pillarbox", "split"], default="auto",
+                    help="auto: split-screen if a streamer facecam overlay is found, else tracking crop "
+                         "with blurred-pillarbox fallback")
+    ap.add_argument("--split-top", type=float, default=0.42, help="Facecam panel share of height")
+    ap.add_argument("--cam-zoom", type=float, default=3.2, help="Facecam panel height / face height")
+    ap.add_argument("--facecam", help="Force facecam box 'cx,cy,w,h' (normalised) for --layout split")
     args = ap.parse_args()
 
     info = media_info(args.input)
@@ -280,20 +361,34 @@ def main() -> None:
 
     if args.layout == "pillarbox":
         n = int(dur * ANALYSIS_FPS) + 1
-        a = {"x": np.full(n, np.nan), "cut": np.zeros(n, bool), "crop_frac": 1.0}
+        a = {"x": np.full(n, np.nan), "cut": np.zeros(n, bool), "crop_frac": 1.0, "facecam": None}
         cam, mode = np.full(n, 0.5), np.zeros(n, bool)
     else:
         a = analyse(args.input, start, dur, info, args)
         cam, mode = smooth_track(a["x"], a["cut"], args)
         if args.layout == "crop":
             mode[:] = True
-    log(f"Crop-mode coverage: {100 * mode.mean():.0f}% (rest blurred pillarbox)")
+            a["facecam"] = None
+        if args.layout == "split" and args.facecam:
+            a["facecam"] = [float(v) for v in args.facecam.split(",")]
+        if args.layout == "split" and a["facecam"] is None:
+            sys.exit("--layout split: no stable facecam found; pass --facecam cx,cy,w,h")
+    facecam = a["facecam"]
+    if facecam is not None:
+        layout = "split-screen (facecam top / gameplay bottom)"
+    elif mode.mean() >= 0.95:
+        layout = "speaker-tracking 9:16 crop"
+    elif mode.mean() <= 0.05:
+        layout = "full-frame blurred pillarbox"
+    else:
+        layout = f"tracking crop with blurred-pillarbox fallback ({100 * mode.mean():.0f}% crop)"
+    log(f"Layout: {layout}")
     save_json({"start": start, "end": end, "fps": fps, "analysis_fps": ANALYSIS_FPS,
                "raw_x": [None if np.isnan(v) else round(float(v), 4) for v in a["x"]],
                "camera_x": [round(float(v), 4) for v in cam], "crop_mode": mode.astype(int).tolist(),
-               "cuts": np.flatnonzero(a["cut"]).tolist()},
+               "cuts": np.flatnonzero(a["cut"]).tolist(), "layout": layout, "facecam": facecam},
               Path(args.out).with_suffix(".track.json"))
-    render(args.input, start, dur, info, cam, mode, a["cut"], args.out, fps, args)
+    render(args.input, start, dur, info, cam, mode, a["cut"], args.out, fps, args, facecam)
 
 
 if __name__ == "__main__":
